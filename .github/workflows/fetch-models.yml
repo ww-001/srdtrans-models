@@ -1,7 +1,11 @@
 name: Fetch SRDTrans models from Zenodo
 
 on:
-  workflow_dispatch:  # manual trigger only
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fetch-models.yml'
 
 jobs:
   fetch-models:
@@ -12,100 +16,60 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Query Zenodo API (with retry) and build file list
-        id: list
+      - name: Try downloading each known model file (no API dependency)
         run: |
           mkdir -p models
           set +e
 
-          # ---- Calcium imaging (record 7818030) ----
-          echo "--- Querying Zenodo API for record 7818030 (calcium) ---"
-          curl -fsSL --retry 5 --retry-delay 8 --retry-connrefused --max-time 60 \
-            "https://zenodo.org/api/records/7818030" -o rec_ca.json
-          RC_CA=$?
-          echo "API status: $RC_CA"
+          # Known filenames from the SRDTrans paper / Zenodo record layouts.
+          # We try multiple candidates per record so that naming variations
+          # (e.g. cad_03hz.pth vs cad_03hz_20.pth) all get covered.
+          declare -a URLS=(
+            # Calcium imaging (Zenodo record 7818030)
+            "https://zenodo.org/records/7818030/files/cad_03hz.pth"
+            "https://zenodo.org/records/7818030/files/cad_03hz_20.pth"
+            "https://zenodo.org/records/7818030/files/cad_30hz.pth"
+            "https://zenodo.org/records/7818030/files/cad_30hz_20.pth"
+            "https://zenodo.org/record/7818030/files/cad_03hz.pth"
+            "https://zenodo.org/record/7818030/files/cad_03hz_20.pth"
+            "https://zenodo.org/record/7818030/files/cad_30hz.pth"
+            "https://zenodo.org/record/7818030/files/cad_30hz_20.pth"
+            # SMLM (Zenodo record 8332544)
+            "https://zenodo.org/records/8332544/files/smlm.pth"
+            "https://zenodo.org/record/8332544/files/smlm.pth"
+            "https://zenodo.org/records/8332544/files/SMLM.pth"
+            "https://zenodo.org/record/8332544/files/SMLM.pth"
+          )
 
-          # Try API first
-          if [ $RC_CA -eq 0 ] && [ -s rec_ca.json ]; then
-            python3 << 'PY' > files_ca.tsv
-          import json
-          with open('rec_ca.json') as f:
-              data = json.load(f)
-          for entry in data.get('files', []):
-              if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
-                  print(f"{entry['key']}\t{entry['links']['self']}")
-          PY
-          fi
-
-          # Fallback: hardcoded filenames based on SRDTrans paper conventions
-          if [ ! -s files_ca.tsv ]; then
-            echo "[WARN] Zenodo API failed; using known filenames as fallback"
-            cat > files_ca.tsv <<'EOF'
-cad_03hz.pth	https://zenodo.org/records/7818030/files/cad_03hz.pth
-cad_30hz.pth	https://zenodo.org/records/7818030/files/cad_30hz.pth
-cad_03hz_20.pth	https://zenodo.org/records/7818030/files/cad_03hz_20.pth
-cad_30hz_20.pth	https://zenodo.org/records/7818030/files/cad_30hz_20.pth
-EOF
-          fi
-          echo "Calcium file list:"
-          cat files_ca.tsv
-
-          # ---- SMLM (record 8332544) ----
-          echo ""
-          echo "--- Querying Zenodo API for record 8332544 (SMLM) ---"
-          curl -fsSL --retry 5 --retry-delay 8 --retry-connrefused --max-time 60 \
-            "https://zenodo.org/api/records/8332544" -o rec_smlm.json
-          RC_SMLM=$?
-          echo "API status: $RC_SMLM"
-
-          if [ $RC_SMLM -eq 0 ] && [ -s rec_smlm.json ]; then
-            python3 << 'PY' > files_smlm.tsv
-          import json
-          with open('rec_smlm.json') as f:
-              data = json.load(f)
-          for entry in data.get('files', []):
-              if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
-                  print(f"{entry['key']}\t{entry['links']['self']}")
-          PY
-          fi
-
-          # SMLM fallback unknown -- just leave empty so download step skips it
-          if [ ! -s files_smlm.tsv ]; then
-            echo "[WARN] Zenodo API failed for SMLM; will skip (filename unknown)"
-            : > files_smlm.tsv
-          fi
-          echo "SMLM file list:"
-          cat files_smlm.tsv
-
-      - name: Download models
-        run: |
-          set +e
-          downloaded=0
-          for tsv in files_ca.tsv files_smlm.tsv; do
-            [ ! -s "$tsv" ] && continue
-            while IFS=$'\t' read -r key url; do
-              [ -z "$key" ] && continue
-              [ -z "$url" ] && continue
-              echo ">>> Downloading $key from $url"
-              if curl -fL --retry 5 --retry-delay 10 --retry-connrefused \
-                   --connect-timeout 30 --max-time 600 -o "models/$key" "$url"; then
-                echo "    OK $(ls -lh models/$key | awk '{print $5}')"
-                downloaded=$((downloaded + 1))
+          ok=0
+          for url in "${URLS[@]}"; do
+            fname=$(basename "$url")
+            echo ">>> Trying $fname"
+            if curl -fsSL --retry 5 --retry-delay 10 --retry-connrefused \
+                 --connect-timeout 30 --max-time 600 \
+                 -o "models/$fname" "$url" 2>/dev/null; then
+              size=$(stat -c%s "models/$fname" 2>/dev/null || echo 0)
+              if [ "$size" -gt 1000 ]; then
+                echo "    OK $(numfmt --to=iec --suffix=B $size 2>/dev/null || echo $size bytes)"
+                ok=$((ok + 1))
               else
-                echo "    FAIL: $key"
-                rm -f "models/$key"
+                echo "    TOO SMALL ($size bytes), removing"
+                rm -f "models/$fname"
               fi
-            done < "$tsv"
+            else
+              echo "    not found (404 or transient error)"
+            fi
           done
+
           echo ""
-          echo ">>> Total downloaded: $downloaded files"
-          if [ $downloaded -eq 0 ]; then
-            echo "::error::No models were downloaded. Check Zenodo URLs / connectivity."
+          echo ">>> Downloaded: $ok files"
+          ls -lh models/
+          if [ $ok -eq 0 ]; then
+            echo "::error::No models downloaded. Zenodo may be blocking GitHub Actions IPs entirely."
             exit 1
           fi
-          ls -lh models/
 
-      - name: Verify checkpoints are valid PyTorch files
+      - name: Verify checkpoints are valid PyTorch state_dicts
         run: |
           python3 - << 'PY'
           import torch, os, sys
