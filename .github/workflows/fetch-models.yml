@@ -1,0 +1,84 @@
+name: Fetch SRDTrans models from Zenodo
+
+on:
+  workflow_dispatch:  # manual trigger only
+
+jobs:
+  fetch-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Query Zenodo API for file list
+        id: list
+        run: |
+          mkdir -p models
+          # Calcium imaging models (cad_03hz + cad_30hz)
+          echo "--- Record 7818030 (calcium imaging) ---"
+          curl -fsSL "https://zenodo.org/api/records/7818030" -o rec_ca.json
+          python3 -c "
+          import json
+          with open('rec_ca.json') as f:
+              data = json.load(f)
+          for entry in data.get('files', []):
+              if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
+                  print(f\"{entry['key']}\\t{entry['links']['self']}\")
+          " | tee files_ca.tsv
+
+          # SMLM model
+          echo "--- Record 8332544 (SMLM) ---"
+          curl -fsSL "https://zenodo.org/api/records/8332544" -o rec_smlm.json
+          python3 -c "
+          import json
+          with open('rec_smlm.json') as f:
+              data = json.load(f)
+          for entry in data.get('files', []):
+              if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
+                  print(f\"{entry['key']}\\t{entry['links']['self']}\")
+          " | tee files_smlm.tsv
+
+      - name: Download calcium imaging models
+        run: |
+          cd models
+          while IFS=$'\t' read -r key url; do
+            [ -z "$key" ] && continue
+            echo ">>> Downloading $key"
+            curl -fL --retry 3 --connect-timeout 30 -o "$key" "$url"
+            ls -lh "$key"
+          done < ../files_ca.tsv
+          cd ..
+
+      - name: Download SMLM model
+        run: |
+          cd models
+          while IFS=$'\t' read -r key url; do
+            [ -z "$key" ] && continue
+            echo ">>> Downloading $key"
+            curl -fL --retry 3 --connect-timeout 30 -o "$key" "$url"
+            ls -lh "$key"
+          done < ../files_smlm.tsv
+          cd ..
+
+      - name: Verify checkpoints are valid PyTorch files
+        run: |
+          python3 -c "
+          import torch, os
+          for f in sorted(os.listdir('models')):
+              try:
+                  sd = torch.load(f'models/{f}', map_location='cpu', weights_only=True)
+                  print(f'{f}: {len(sd)} tensors, {os.path.getsize(f\"models/{f}\")/1024/1024:.1f} MB')
+              except Exception as e:
+                  print(f'{f}: VERIFICATION FAILED -> {e}')
+                  raise
+          "
+
+      - name: Upload models as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: srdtrans-models
+          path: models/
+          if-no-files-found: error
+          retention-days: 14
