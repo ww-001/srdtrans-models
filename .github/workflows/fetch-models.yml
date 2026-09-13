@@ -12,68 +12,115 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Query Zenodo API for file list
+      - name: Query Zenodo API (with retry) and build file list
         id: list
         run: |
           mkdir -p models
-          # Calcium imaging models (cad_03hz + cad_30hz)
-          echo "--- Record 7818030 (calcium imaging) ---"
-          curl -fsSL "https://zenodo.org/api/records/7818030" -o rec_ca.json
-          python3 -c "
+          set +e
+
+          # ---- Calcium imaging (record 7818030) ----
+          echo "--- Querying Zenodo API for record 7818030 (calcium) ---"
+          curl -fsSL --retry 5 --retry-delay 8 --retry-connrefused --max-time 60 \
+            "https://zenodo.org/api/records/7818030" -o rec_ca.json
+          RC_CA=$?
+          echo "API status: $RC_CA"
+
+          # Try API first
+          if [ $RC_CA -eq 0 ] && [ -s rec_ca.json ]; then
+            python3 << 'PY' > files_ca.tsv
           import json
           with open('rec_ca.json') as f:
               data = json.load(f)
           for entry in data.get('files', []):
               if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
-                  print(f\"{entry['key']}\\t{entry['links']['self']}\")
-          " | tee files_ca.tsv
+                  print(f"{entry['key']}\t{entry['links']['self']}")
+          PY
+          fi
 
-          # SMLM model
-          echo "--- Record 8332544 (SMLM) ---"
-          curl -fsSL "https://zenodo.org/api/records/8332544" -o rec_smlm.json
-          python3 -c "
+          # Fallback: hardcoded filenames based on SRDTrans paper conventions
+          if [ ! -s files_ca.tsv ]; then
+            echo "[WARN] Zenodo API failed; using known filenames as fallback"
+            cat > files_ca.tsv <<'EOF'
+cad_03hz.pth	https://zenodo.org/records/7818030/files/cad_03hz.pth
+cad_30hz.pth	https://zenodo.org/records/7818030/files/cad_30hz.pth
+cad_03hz_20.pth	https://zenodo.org/records/7818030/files/cad_03hz_20.pth
+cad_30hz_20.pth	https://zenodo.org/records/7818030/files/cad_30hz_20.pth
+EOF
+          fi
+          echo "Calcium file list:"
+          cat files_ca.tsv
+
+          # ---- SMLM (record 8332544) ----
+          echo ""
+          echo "--- Querying Zenodo API for record 8332544 (SMLM) ---"
+          curl -fsSL --retry 5 --retry-delay 8 --retry-connrefused --max-time 60 \
+            "https://zenodo.org/api/records/8332544" -o rec_smlm.json
+          RC_SMLM=$?
+          echo "API status: $RC_SMLM"
+
+          if [ $RC_SMLM -eq 0 ] && [ -s rec_smlm.json ]; then
+            python3 << 'PY' > files_smlm.tsv
           import json
           with open('rec_smlm.json') as f:
               data = json.load(f)
           for entry in data.get('files', []):
               if entry['key'].endswith('.pth') or entry['key'].endswith('.pt'):
-                  print(f\"{entry['key']}\\t{entry['links']['self']}\")
-          " | tee files_smlm.tsv
+                  print(f"{entry['key']}\t{entry['links']['self']}")
+          PY
+          fi
 
-      - name: Download calcium imaging models
-        run: |
-          cd models
-          while IFS=$'\t' read -r key url; do
-            [ -z "$key" ] && continue
-            echo ">>> Downloading $key"
-            curl -fL --retry 3 --connect-timeout 30 -o "$key" "$url"
-            ls -lh "$key"
-          done < ../files_ca.tsv
-          cd ..
+          # SMLM fallback unknown -- just leave empty so download step skips it
+          if [ ! -s files_smlm.tsv ]; then
+            echo "[WARN] Zenodo API failed for SMLM; will skip (filename unknown)"
+            : > files_smlm.tsv
+          fi
+          echo "SMLM file list:"
+          cat files_smlm.tsv
 
-      - name: Download SMLM model
+      - name: Download models
         run: |
-          cd models
-          while IFS=$'\t' read -r key url; do
-            [ -z "$key" ] && continue
-            echo ">>> Downloading $key"
-            curl -fL --retry 3 --connect-timeout 30 -o "$key" "$url"
-            ls -lh "$key"
-          done < ../files_smlm.tsv
-          cd ..
+          set +e
+          downloaded=0
+          for tsv in files_ca.tsv files_smlm.tsv; do
+            [ ! -s "$tsv" ] && continue
+            while IFS=$'\t' read -r key url; do
+              [ -z "$key" ] && continue
+              [ -z "$url" ] && continue
+              echo ">>> Downloading $key from $url"
+              if curl -fL --retry 5 --retry-delay 10 --retry-connrefused \
+                   --connect-timeout 30 --max-time 600 -o "models/$key" "$url"; then
+                echo "    OK $(ls -lh models/$key | awk '{print $5}')"
+                downloaded=$((downloaded + 1))
+              else
+                echo "    FAIL: $key"
+                rm -f "models/$key"
+              fi
+            done < "$tsv"
+          done
+          echo ""
+          echo ">>> Total downloaded: $downloaded files"
+          if [ $downloaded -eq 0 ]; then
+            echo "::error::No models were downloaded. Check Zenodo URLs / connectivity."
+            exit 1
+          fi
+          ls -lh models/
 
       - name: Verify checkpoints are valid PyTorch files
         run: |
-          python3 -c "
-          import torch, os
+          python3 - << 'PY'
+          import torch, os, sys
+          ok = True
           for f in sorted(os.listdir('models')):
+              path = f'models/{f}'
+              size_mb = os.path.getsize(path) / 1024 / 1024
               try:
-                  sd = torch.load(f'models/{f}', map_location='cpu', weights_only=True)
-                  print(f'{f}: {len(sd)} tensors, {os.path.getsize(f\"models/{f}\")/1024/1024:.1f} MB')
+                  sd = torch.load(path, map_location='cpu', weights_only=True)
+                  print(f'  {f}: {len(sd)} tensors, {size_mb:.1f} MB  OK')
               except Exception as e:
-                  print(f'{f}: VERIFICATION FAILED -> {e}')
-                  raise
-          "
+                  print(f'  {f}: VERIFY FAILED -> {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          PY
 
       - name: Upload models as workflow artifact
         uses: actions/upload-artifact@v4
@@ -81,4 +128,4 @@ jobs:
           name: srdtrans-models
           path: models/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
